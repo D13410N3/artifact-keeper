@@ -627,8 +627,9 @@ async fn trigger_checks(
     auth.require_admin()?;
     if let Some(artifact_id) = body.artifact_id {
         let db = state.db.clone();
+        let storage_registry = state.storage_registry.clone();
         tokio::spawn(async move {
-            let svc = QualityCheckService::new(db);
+            let svc = QualityCheckService::new(db).with_storage_registry(storage_registry);
             if let Err(e) = svc.check_artifact(artifact_id).await {
                 tracing::error!("Quality checks failed for artifact {}: {}", artifact_id, e);
             }
@@ -652,8 +653,9 @@ async fn trigger_checks(
     .map_err(|e| AppError::Database(e.to_string()))?;
 
     let db = state.db.clone();
+    let storage_registry = state.storage_registry.clone();
     tokio::spawn(async move {
-        let svc = QualityCheckService::new(db);
+        let svc = QualityCheckService::new(db).with_storage_registry(storage_registry);
         if let Err(e) = svc.check_repository(repository_id).await {
             tracing::error!(
                 "Quality checks failed for repository {}: {}",
@@ -1972,6 +1974,94 @@ mod tests {
         let (status, _) = tdh::send(app, req).await;
         assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
         tdh::cleanup(&pool, repo_id, user_id).await;
+    }
+
+    /// #3736 regression: `/checks/trigger` must execute quality checks using
+    /// the repository's configured storage backend (e.g. S3), not a
+    /// filesystem fallback. Before the fix, trigger paths built
+    /// `QualityCheckService` without wiring `StorageRegistry`, so cloud-backed
+    /// artifacts failed to stage and no quality-check rows were written.
+    #[tokio::test]
+    async fn test_trigger_checks_uses_repo_storage_backend_3736() {
+        use crate::api::handlers::proxy_helpers::RepoInfo;
+        use bytes::Bytes;
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let (repo_id, repo_key, storage_dir) = tdh::create_repo(&pool, "local", "rpm").await;
+
+        let (state, mem) = tdh::build_state_with_cloud(pool.clone(), "s3");
+        sqlx::query("UPDATE repositories SET storage_backend = 's3' WHERE id = $1")
+            .bind(repo_id)
+            .execute(&pool)
+            .await
+            .expect("set repo storage backend to s3");
+
+        let repo_info = RepoInfo {
+            storage_backend: "s3".to_string(),
+            ..tdh::make_repo_info(repo_id, &repo_key, &storage_dir, "local", None)
+        };
+
+        let artifact_id = tdh::seed_artifact(
+            &state,
+            &pool,
+            &repo_info,
+            "rpm/demo/1.0/demo-1.0.rpm",
+            "demo/1.0/demo-1.0.rpm",
+            "demo",
+            "1.0",
+            "application/octet-stream",
+            Bytes::from_static(b"quality-gate-regression-3736"),
+            user_id,
+        )
+        .await;
+
+        let auth = tdh::admin_auth(user_id, &username);
+        let app = router()
+            .with_state(state)
+            .layer(axum::Extension(auth.clone()))
+            .layer(axum::Extension(Some(auth)));
+
+        let reads_before = mem.get_count();
+
+        let req = tdh::post(
+            "/checks/trigger".to_string(),
+            "application/json",
+            serde_json::json!({ "artifact_id": artifact_id })
+                .to_string()
+                .into(),
+        );
+        let (status, _body) = tdh::send(app, req).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+
+        let mut check_count = 0i64;
+        for _ in 0..100 {
+            check_count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*)::int8 FROM quality_check_results WHERE artifact_id = $1",
+            )
+            .bind(artifact_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count quality check rows");
+            if check_count > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(
+            check_count > 0,
+            "expected at least one quality check result row for artifact {artifact_id}"
+        );
+        assert!(
+            mem.get_count() > reads_before,
+            "expected quality checks to read artifact bytes through configured cloud backend"
+        );
+
+        tdh::cleanup(&pool, repo_id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
     #[tokio::test]
