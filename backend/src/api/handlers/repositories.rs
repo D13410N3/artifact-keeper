@@ -1304,6 +1304,41 @@ fn is_debian_remote(repo_type: &RepositoryType, format: &RepositoryFormat) -> bo
     *repo_type == RepositoryType::Remote && matches!(format, RepositoryFormat::Debian)
 }
 
+/// Classify an inline `debian` proxy-filter payload against its target
+/// repository (#2460): `Ok(true)` = apply it, `Ok(false)` = it configures
+/// nothing here, so skip it, `Err(_)` = it asks for something this target
+/// cannot consume.
+///
+/// Only a Debian *Remote* can carry the filter. On every other type an
+/// all-*default* payload is skipped rather than rejected: released web UIs
+/// attach exactly that for an untouched Debian form — the create dialog sends
+/// `debian: {distribution_paths: [], components: [], architectures: []}` for
+/// **every** Debian-format repository, local ones included — so a present but
+/// empty object made creating a local Debian repository impossible. The
+/// payload configures nothing (the backend's own default is "no filter
+/// stored"), so skipping it loses nothing. A payload that *sets* anything on
+/// an unconsumable target is still rejected, preserving the dead-state guard
+/// (#2460).
+///
+/// `sets_nothing` is the payload-shape-specific "configures nothing" test:
+/// `*cfg == DebianRepositoryConfig::default()` on create, `*patch ==
+/// DebianConfigPatch::default()` on update.
+fn classify_debian_payload(
+    repo_type: &RepositoryType,
+    format: &RepositoryFormat,
+    sets_nothing: bool,
+) -> Result<bool> {
+    if is_debian_remote(repo_type, format) {
+        return Ok(true);
+    }
+    if sets_nothing {
+        return Ok(false);
+    }
+    Err(AppError::Validation(
+        "debian filter config is only valid for Debian remote (proxy) repositories".to_string(),
+    ))
+}
+
 /// Validate a `DebianRepositoryConfig` for the 1.6.0 passthrough-only feature
 /// set, mapping the reason string to a 422 [`AppError::UnprocessableEntity`].
 fn validate_debian_config(cfg: &DebianRepositoryConfig) -> Result<()> {
@@ -2859,14 +2894,19 @@ pub async fn create_repository(
     // unsupported strategy/inconsistent filter) cannot leave an orphaned
     // repository behind, mirroring the apt_* and npm guards above. Persistence
     // happens after `service.create(...)`, once `repo.id` exists.
+    //
+    // An all-default payload on a repository the filter is not configurable on
+    // is the released web UI's untouched-form artifact, not a configuration
+    // attempt: it configures nothing, so `classify_debian_payload` skips it
+    // instead of failing the whole create.
     if let Some(ref cfg) = payload.debian {
-        if !is_debian_remote(&repo_type, &format) {
-            return Err(AppError::Validation(
-                "debian filter config is only valid for Debian remote (proxy) repositories"
-                    .to_string(),
-            ));
+        if classify_debian_payload(
+            &repo_type,
+            &format,
+            *cfg == DebianRepositoryConfig::default(),
+        )? {
+            validate_debian_config(cfg)?;
         }
-        validate_debian_config(cfg)?;
     }
 
     // Resolve storage backend: use the requested one or fall back to the default.
@@ -3059,9 +3099,14 @@ pub async fn create_repository(
     }
 
     // Persist the Debian remote proxy filter (#2460). Validation already ran
-    // up-front (before create), so here we only serialize + store it.
+    // up-front (before create), so here we only serialize + store it. An
+    // all-default payload on a non-Debian-remote repo was accepted as a no-op
+    // above — skip persistence too, so it cannot leave a dead config row
+    // behind.
     if let Some(ref cfg) = payload.debian {
-        upsert_debian_config(&state.db, repo.id, cfg).await?;
+        if is_debian_remote(&repo.repo_type, &repo.format) {
+            upsert_debian_config(&state.db, repo.id, cfg).await?;
+        }
     }
 
     // Add virtual repository members. Post-#1444, the validator accepts
@@ -4049,6 +4094,10 @@ pub async fn update_repository(
     //                                    stored config, validate, persist.
     // The gate reads the config live on every request, so no cache
     // invalidation is required for a change to take effect.
+    //
+    // An all-`None` patch on a repository the filter is not configurable on is
+    // the same untouched-form artifact as on create (`"debian": {}`): it
+    // merges nothing, so it is skipped rather than rejected.
     match payload.debian {
         None => {}
         Some(None) => {
@@ -4059,13 +4108,17 @@ pub async fn update_repository(
                 .await
                 .map_err(|e| AppError::Database(e.to_string()))?;
         }
-        Some(Some(ref patch)) => {
-            if !is_debian_remote(&existing.repo_type, &existing.format) {
-                return Err(AppError::Validation(
-                    "debian filter config is only valid for Debian remote (proxy) repositories"
-                        .to_string(),
-                ));
-            }
+        // A patch that sets something is only valid for a Debian Remote. An
+        // all-`None` patch on any other type is the untouched-form artifact
+        // (`"debian": {}`): it merges nothing, so it falls through to the
+        // no-op arm below instead of failing the update.
+        Some(Some(ref patch))
+            if classify_debian_payload(
+                &existing.repo_type,
+                &existing.format,
+                *patch == DebianConfigPatch::default(),
+            )? =>
+        {
             let base = load_debian_config(&state.db, repo.id)
                 .await
                 .unwrap_or_default();
@@ -4073,6 +4126,8 @@ pub async fn update_repository(
             validate_debian_config(&merged)?;
             upsert_debian_config(&state.db, repo.id, &merged).await?;
         }
+        // The skipped untouched-form patch: nothing to merge, nothing stored.
+        Some(Some(_)) => {}
     }
 
     // Invalidate the in-memory repo cache so that visibility changes take
@@ -11414,6 +11469,120 @@ mod tests {
         // A trailing slash would otherwise yield an empty basename; fall back
         // to the full path rather than emitting an empty filename.
         assert_eq!(download_filename("a/b/"), "a/b/");
+    }
+
+    // -----------------------------------------------------------------------
+    // Debian proxy-filter payload gate (#2460): an untouched web-UI form on a
+    // non-Remote repository is a no-op, not a validation error.
+    // -----------------------------------------------------------------------
+
+    /// The payload the web UI create dialog attaches to every Debian-format
+    /// repository when its Debian/APT fields are untouched
+    /// (`buildDebianConfigFields` in artifact-keeper-web): three empty
+    /// allowlists and nothing else.
+    fn untouched_web_debian_payload() -> serde_json::Value {
+        serde_json::json!({
+            "distribution_paths": [],
+            "components": [],
+            "architectures": [],
+        })
+    }
+
+    #[test]
+    fn untouched_web_debian_payload_deserializes_to_the_default_config() {
+        // The regression this guards: the object is *present*, so the old
+        // `if let Some(cfg) = payload.debian` gate treated it as a supplied
+        // proxy filter and rejected the create on a local repository.
+        let cfg: DebianRepositoryConfig =
+            serde_json::from_value(untouched_web_debian_payload()).expect("payload deserializes");
+        assert_eq!(cfg, DebianRepositoryConfig::default());
+        assert!(cfg.is_passthrough_all());
+    }
+
+    #[test]
+    fn create_gate_skips_the_untouched_web_payload_on_every_non_remote_type() {
+        for repo_type in [
+            &RepositoryType::Local,
+            &RepositoryType::Virtual,
+            &RepositoryType::Staging,
+        ] {
+            assert!(
+                !classify_debian_payload(repo_type, &RepositoryFormat::Debian, true)
+                    .expect("an untouched-form payload is not an error"),
+                "{repo_type:?} must accept the untouched web-UI Debian payload"
+            );
+        }
+    }
+
+    #[test]
+    fn create_gate_still_rejects_a_configuring_payload_on_non_remote() {
+        // A payload that sets something has no consumer on these types: the
+        // value would be dead state (#2460), so it stays rejected.
+        for repo_type in [
+            &RepositoryType::Local,
+            &RepositoryType::Virtual,
+            &RepositoryType::Staging,
+        ] {
+            assert!(
+                classify_debian_payload(repo_type, &RepositoryFormat::Debian, false).is_err(),
+                "{repo_type:?} must reject a configuring Debian payload"
+            );
+        }
+        // A non-Debian format cannot carry the filter either, even on a Remote.
+        assert!(
+            classify_debian_payload(&RepositoryType::Remote, &RepositoryFormat::Maven, false)
+                .is_err()
+        );
+        assert!(
+            !classify_debian_payload(&RepositoryType::Remote, &RepositoryFormat::Maven, true)
+                .expect("an untouched-form payload is not an error")
+        );
+    }
+
+    #[test]
+    fn remote_debian_payloads_are_always_applied() {
+        // A Debian Remote is the one target the filter is configurable on, so
+        // both an untouched-form payload (an explicit full-proxy config) and a
+        // configuring one are applied — and the all-default one still
+        // validates, which is what keeps the web UI's remote-create path
+        // working.
+        assert!(
+            classify_debian_payload(&RepositoryType::Remote, &RepositoryFormat::Debian, true)
+                .unwrap()
+        );
+        assert!(
+            classify_debian_payload(&RepositoryType::Remote, &RepositoryFormat::Debian, false)
+                .unwrap()
+        );
+        assert!(validate_debian_config(&DebianRepositoryConfig::default()).is_ok());
+    }
+
+    #[test]
+    fn update_gate_treats_an_empty_debian_object_as_an_untouched_form() {
+        // `"debian": {}` on update deserializes to `Some(Some(default))` (the
+        // three-way semantics) — every field omitted, so it merges nothing and
+        // must be skipped on a non-Debian-remote, not rejected.
+        let req: UpdateRepositoryRequest =
+            serde_json::from_value(serde_json::json!({ "debian": {} }))
+                .expect("update payload deserializes");
+        let patch = match req.debian {
+            Some(Some(patch)) => patch,
+            other => panic!("expected a present patch, got {other:?}"),
+        };
+        assert_eq!(patch, DebianConfigPatch::default());
+        assert!(!classify_debian_payload(
+            &RepositoryType::Local,
+            &RepositoryFormat::Debian,
+            patch == DebianConfigPatch::default()
+        )
+        .expect("an untouched-form patch is not an error"));
+
+        // An explicit `null` is a *clear*, not an untouched form: it stays on
+        // the `Some(None)` arm, which never reaches the gate.
+        let cleared: UpdateRepositoryRequest =
+            serde_json::from_value(serde_json::json!({ "debian": null }))
+                .expect("clear payload deserializes");
+        assert_eq!(cleared.debian, Some(None));
     }
 
     // -----------------------------------------------------------------------
