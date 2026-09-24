@@ -4050,6 +4050,7 @@ fn build_vscode_publish_response(publisher: &str, name: &str, version: &str) -> 
     })
 }
 
+#[cfg(ak_test_shard = "router")]
 #[cfg(test)]
 mod tests {
 
@@ -7620,6 +7621,7 @@ mod tests {
 // #3956: a hosted repository answers the gallery protocol from its own rows.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod hosted_gallery_tests {
     use super::*;
@@ -7852,6 +7854,7 @@ mod hosted_gallery_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod hosted_gallery_db_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -8212,6 +8215,7 @@ mod hosted_gallery_db_tests {
     }
 }
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod db_cov_tests {
     use crate::api::handlers::test_db_helpers as tdh;
@@ -8240,6 +8244,7 @@ mod db_cov_tests {
 // #3659: the native publish path must register the package catalog row.
 // ---------------------------------------------------------------------------
 
+#[cfg(ak_test_shard = "handlers-2")]
 #[cfg(test)]
 mod catalog_registration_tests {
     use crate::api::handlers::test_db_helpers as tdh;
