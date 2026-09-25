@@ -16786,6 +16786,157 @@ mod tests {
         let _ = std::fs::remove_dir_all(&storage_dir);
     }
 
+    /// The Debian counterpart of the npm gate above (#2460): the create dialog
+    /// attaches `debian: {distribution_paths: [], components: [],
+    /// architectures: []}` to EVERY Debian-format create — local, staging and
+    /// virtual included — and that untouched form used to make a local Debian
+    /// repository impossible to create ("debian filter config is only valid for
+    /// Debian remote (proxy) repositories"). It configures nothing, so it must
+    /// be a no-op on those targets, while a payload that *sets* something stays
+    /// rejected there (#2460 dead-state guard) and a Debian Remote still
+    /// validates and persists its filter.
+    #[tokio::test]
+    async fn debian_untouched_form_create_and_update_gate_db() {
+        use crate::api::handlers::test_db_helpers as tdh;
+        use axum::extract::{Extension, Path, State};
+
+        let Some(pool) = tdh::try_pool().await else {
+            return;
+        };
+        let (user_id, username) = tdh::create_user(&pool).await;
+        let storage_dir = std::env::temp_dir().join(format!("debian-gate-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&storage_dir).expect("create storage dir");
+        let state = tdh::build_state(pool.clone(), storage_dir.to_str().unwrap());
+        let admin = admin_auth(user_id, &username);
+
+        // 1) The reported bug: the untouched web-UI form on a LOCAL Debian
+        //    create must succeed, and must not leave a dead config row.
+        let local_key = format!("deb-local-{}", Uuid::new_v4().simple());
+        let Json(local) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &local_key,
+                "local debian",
+                "debian",
+                serde_json::json!({
+                    "repo_type": "local",
+                    "debian": {
+                        "distribution_paths": [],
+                        "components": [],
+                        "architectures": []
+                    }
+                }),
+            ),
+        )
+        .await
+        .expect("local Debian create with an untouched filter form must succeed");
+        assert_eq!(local.key, local_key);
+        let local_cfg: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM repository_config \
+             WHERE repository_id = $1 AND key = 'debian_config'",
+        )
+        .bind(local.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count debian_config");
+        assert_eq!(
+            local_cfg, 0,
+            "an untouched-form payload must not persist dead config rows"
+        );
+
+        // 2) A payload that SETS something on a non-Remote target is still
+        //    rejected (dead-state guard, #2460) — and leaves no orphan row.
+        let bad_key = format!("deb-local-bad-{}", Uuid::new_v4().simple());
+        let err = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &bad_key,
+                "local debian filtered",
+                "debian",
+                serde_json::json!({
+                    "repo_type": "local",
+                    "debian": { "distribution_paths": ["bookworm"] }
+                }),
+            ),
+        )
+        .await
+        .expect_err("a configuring filter on a local Debian repo must still be rejected");
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("Debian remote")),
+            "expected the remote-only Validation error, got {err:?}",
+        );
+
+        // 3) Positive control: a real filter on a Debian Remote still validates
+        //    AND persists.
+        let remote_key = format!("deb-remote-{}", Uuid::new_v4().simple());
+        let Json(remote) = create_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            make_create_request(
+                &remote_key,
+                "debian remote",
+                "debian",
+                serde_json::json!({
+                    "repo_type": "remote",
+                    "upstream_url": "https://deb.debian.org/debian",
+                    "debian": {
+                        "distribution_paths": ["bookworm"],
+                        "components": ["main"]
+                    }
+                }),
+            ),
+        )
+        .await
+        .expect("Debian remote create with a real filter must succeed");
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM repository_config \
+             WHERE repository_id = $1 AND key = 'debian_config'",
+        )
+        .bind(remote.id)
+        .fetch_optional(&pool)
+        .await
+        .expect("query debian_config");
+        let stored = stored.expect("a Debian remote create must persist its filter");
+        assert!(stored.contains("bookworm"), "stored config: {stored}");
+
+        // 4) The update path: `"debian": {}` (an all-`None` patch) on a LOCAL
+        //    repo is the same untouched-form artifact — a no-op, not a 400.
+        let patch: UpdateRepositoryRequest =
+            serde_json::from_str(r#"{"debian": {}}"#).expect("deserialize update payload");
+        update_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(local_key.clone()),
+            Json(patch),
+        )
+        .await
+        .expect("an untouched-form patch on a local Debian update must succeed");
+
+        // 5) ...while a patch that sets something is still rejected there.
+        let bad_patch: UpdateRepositoryRequest =
+            serde_json::from_str(r#"{"debian": {"components": ["main"]}}"#)
+                .expect("deserialize update payload");
+        let err = update_repository(
+            State(state.clone()),
+            Extension(Some(admin.clone())),
+            Path(local_key.clone()),
+            Json(bad_patch),
+        )
+        .await
+        .expect_err("a configuring patch on a local Debian repo must still be rejected");
+        assert!(
+            matches!(err, AppError::Validation(ref m) if m.contains("Debian remote")),
+            "expected the remote-only Validation error, got {err:?}",
+        );
+
+        // Cleanup.
+        tdh::cleanup(&pool, local.id, user_id).await;
+        tdh::cleanup(&pool, remote.id, user_id).await;
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
     /// #2321 G2 (write): the generic REST `upload_artifact` handler enforces the
     /// fine-grained `write` action AFTER the tenant gate. A read-only grantee on
     /// a rules-bearing private repo is DENIED; adding `write` lets them through;
